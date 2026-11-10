@@ -113,7 +113,10 @@ class AiArtifact < ActiveRecord::Base
     return false if source_post.blank? || source_post.topic.blank?
 
     shared_conversation = SharedAiConversation.find_by(target: source_post.topic) if public?
-    return true if public? && (shared_conversation.blank? || shared_conversation.publicly_visible?)
+    if public? && shared_conversation&.publicly_visible? &&
+         shared_conversation.context.any? { |context_post| context_post["id"] == source_post.id }
+      return true
+    end
 
     guardian.can_see?(source_post)
   end

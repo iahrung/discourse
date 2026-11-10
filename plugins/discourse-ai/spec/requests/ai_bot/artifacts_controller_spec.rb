@@ -1,6 +1,6 @@
 # frozen_string_literal: true
 
-RSpec.describe DiscourseAi::AiBot::ArtifactsController do
+describe DiscourseAi::AiBot::ArtifactsController do
   fab!(:user)
   fab!(:topic) { Fabricate(:private_message_topic, user: user) }
   fab!(:post) { Fabricate(:post, user: user, topic: topic) }
@@ -20,6 +20,18 @@ RSpec.describe DiscourseAi::AiBot::ArtifactsController do
 
   def parse_srcdoc(html)
     Nokogiri.HTML5(html).at_css("iframe")["srcdoc"]
+  end
+
+  def share_topic_publicly(topic)
+    llm_model = Fabricate(:llm_model)
+    bot_user = Fabricate(:ai_agent, default_llm: llm_model).ensure_user!
+    toggle_enabled_bots(bots: [llm_model])
+    SiteSetting.ai_bot_enabled = true
+    SiteSetting.ai_bot_public_sharing_allowed_groups = "10"
+    Group.user_trust_level_change!(user.id, user.trust_level)
+    topic.topic_allowed_users.where.not(user_id: user.id).delete_all
+    topic.topic_allowed_users.create!(user: bot_user)
+    SharedAiConversation.share_conversation(user, topic)
   end
 
   before do
@@ -210,7 +222,10 @@ RSpec.describe DiscourseAi::AiBot::ArtifactsController do
     end
 
     it "returns a public source name to guests and hides a trashed source" do
-      artifact.update!(metadata: { public: true })
+      post.update_columns(
+        cooked: "<div class='ai-artifact' data-ai-artifact-id='#{artifact.id}'></div>",
+      )
+      share_topic_publicly(topic)
       path = "/discourse-ai/ai-bot/artifacts/#{artifact.id}/metadata.json"
 
       get path
@@ -343,7 +358,12 @@ RSpec.describe DiscourseAi::AiBot::ArtifactsController do
     end
 
     context "with public artifact" do
-      before { artifact.update!(metadata: { public: true }) }
+      before do
+        post.update_columns(
+          cooked: "<div class='ai-artifact' data-ai-artifact-id='#{artifact.id}'></div>",
+        )
+        share_topic_publicly(topic)
+      end
 
       it "shows artifact without authentication" do
         get "/discourse-ai/ai-bot/artifacts/#{artifact.id}"
@@ -357,6 +377,82 @@ RSpec.describe DiscourseAi::AiBot::ArtifactsController do
         get "/discourse-ai/ai-bot/artifacts/#{artifact.id}"
         expect(response.status).to eq(404)
       end
+    end
+
+    it "hides a private artifact whose public flag has no conversation share" do
+      artifact.update!(metadata: { public: true })
+
+      get artifact.url
+      expect(response.status).to eq(404)
+    end
+
+    it "does not publish a moved artifact through an existing destination share" do
+      artifact_post = Fabricate(:post, topic: topic, user: user)
+      artifact.update!(post: artifact_post)
+      artifact_post.update_columns(
+        cooked: "<div class='ai-artifact' data-ai-artifact-id='#{artifact.id}'></div>",
+      )
+      share_topic_publicly(topic)
+      get artifact.url
+      expect(response.status).to eq(200)
+      expect(parse_srcdoc(response.body)).to include(artifact.html)
+      destination = Fabricate(:private_message_topic, user: user)
+      Fabricate(:post, topic: destination, user: user)
+      destination_share = share_topic_publicly(destination)
+      PostMover.new(topic, Discourse.system_user, [artifact_post.id]).to_topic(destination.id)
+
+      get "/discourse-ai/ai-bot/shared-ai-conversations/#{destination_share.share_key}.json"
+      expect(response.status).to eq(200)
+      get artifact.url
+      expect(response.status).to eq(404)
+      get "/discourse-ai/ai-bot/artifacts/#{artifact.id}/metadata.json"
+      expect(response.status).to eq(404)
+      get "/discourse-ai/ai-bot/artifact-key-values/#{artifact.id}.json"
+      expect(response.status).to eq(404)
+    end
+
+    it "revokes access to moved artifacts and later edits when a conversation is unshared" do
+      artifact_post = Fabricate(:post, topic: topic, user: user)
+      artifact.update!(post: artifact_post)
+      artifact_post.update_columns(
+        cooked: "<div class='ai-artifact' data-ai-artifact-id='#{artifact.id}'></div>",
+      )
+      conversation = share_topic_publicly(topic)
+
+      get artifact.url
+      expect(response.status).to eq(200)
+      expect(parse_srcdoc(response.body)).to include(artifact.html)
+
+      destination = Fabricate(:private_message_topic, user: user)
+      PostMover.new(topic, Discourse.system_user, [artifact_post.id]).to_topic(destination.id)
+      expect(artifact_post.reload.topic_id).to eq(destination.id)
+
+      sign_in(user)
+      delete "/discourse-ai/ai-bot/shared-ai-conversations/#{conversation.share_key}.json"
+      expect(response.status).to eq(200)
+
+      admin = Fabricate(:admin)
+      sign_in(admin)
+      private_html = "<p>Private update 猫</p>"
+      put "/admin/plugins/discourse-ai/ai-artifacts/#{artifact.id}.json",
+          params: { ai_artifact: { html: private_html } }.to_json,
+          headers: {
+            "CONTENT_TYPE" => "application/json",
+          }
+      expect(response.status).to eq(200)
+      expect(artifact.reload.html).to eq(private_html)
+      delete "/session/#{admin.username}.json"
+      expect(response.status).to eq(302)
+
+      get artifact.url
+      expect(response.status).to eq(404)
+      get "/discourse-ai/ai-bot/artifacts/#{artifact.id}/metadata.json"
+      expect(response.status).to eq(404)
+
+      sign_in(user)
+      get artifact.url
+      expect(response.status).to eq(200)
+      expect(parse_srcdoc(response.body)).to include(private_html)
     end
 
     it "hides artifacts and future versions when their conversation share is invalidated" do
