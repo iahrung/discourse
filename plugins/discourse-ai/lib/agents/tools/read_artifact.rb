@@ -74,7 +74,7 @@ module DiscourseAi
             source_artifact = AiArtifact.find_by(id: artifact_id)
             return error_response("Artifact not found") if !source_artifact
 
-            if !source_artifact.public? && !Guardian.new(post.user).can_see?(source_artifact.post)
+            if !source_artifact.available_to?(Guardian.new(post.user))
               return error_response("Access denied")
             end
             new_artifact = clone_artifact(source_artifact, version)
