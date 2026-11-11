@@ -114,7 +114,8 @@ class AiArtifact < ActiveRecord::Base
 
     shared_conversation = SharedAiConversation.find_by(target: source_post.topic) if public?
     if public? && shared_conversation&.publicly_visible? &&
-         shared_conversation.context.any? { |context_post| context_post["id"] == source_post.id }
+         shared_conversation.context.any? { |context_post| context_post["id"] == source_post.id } &&
+         shared_conversation.publishes_artifact?(self)
       return true
     end
 
@@ -135,7 +136,8 @@ class AiArtifact < ActiveRecord::Base
 
     conversation = SharedAiConversation.find_by(target: topic)
     conversation&.publicly_visible? &&
-      conversation.context.any? { |context_post| context_post["id"] == source_post.id }
+      conversation.context.any? { |context_post| context_post["id"] == source_post.id } &&
+      conversation.publishes_artifact?(self)
   end
 
   def public?

@@ -411,6 +411,69 @@ describe DiscourseAi::AiBot::ArtifactsController do
       expect(response.status).to eq(404)
     end
 
+    it "does not publish an unreferenced artifact when its source post is moved and shared again" do
+      artifact_post = Fabricate(:post, topic: topic, user: user, cooked: "<p>Private source 猫</p>")
+      artifact.update!(post: artifact_post)
+      Fabricate(
+        :post,
+        topic: topic,
+        user: user,
+        cooked: "<div class='ai-artifact' data-ai-artifact-id='#{artifact.id}'></div>",
+      )
+      original_share = share_topic_publicly(topic)
+      get artifact.url
+      expect(response.status).to eq(200)
+      original_share.update!(
+        context:
+          original_share.context.map do |context_post|
+            context_post.except("artifact_ids").merge(
+              "cooked" =>
+                context_post["cooked"].gsub(Discourse.base_url, "https://old.example.com"),
+            )
+          end,
+      )
+      get artifact.url
+      expect(response.status).to eq(200)
+
+      destination = Fabricate(:private_message_topic, user: user)
+      Fabricate(:post, topic: destination, user: user)
+      PostMover.new(topic, Discourse.system_user, [artifact_post.id]).to_topic(destination.id)
+      SharedAiConversation.destroy_conversation(original_share)
+      destination_share = share_topic_publicly(destination)
+      expect(destination_share.publicly_visible?).to eq(true)
+      expect(artifact.reload.public?).to eq(true)
+      expect(
+        destination_share.context.flat_map { |context_post| context_post["artifact_ids"] },
+      ).not_to include(artifact.id)
+
+      artifact.update!(html: "<p>Private edit 猫</p>")
+      version = artifact.create_new_version(html: "<p>Private saved version 猫</p>")
+
+      [
+        artifact.url,
+        AiArtifact.url(artifact.id, version.version_number),
+        AiArtifact.embed_url(artifact.id),
+        AiArtifact.embed_url(artifact.id, version.version_number),
+        "/discourse-ai/ai-bot/artifacts/#{artifact.id}/metadata.json",
+        "/discourse-ai/ai-bot/artifact-key-values/#{artifact.id}.json",
+      ].each do |url|
+        get url
+        expect(response.status).to eq(404), "Expected #{url} to be private"
+      end
+
+      destination_share.update!(
+        context:
+          destination_share.context.map { |context_post| context_post.except("artifact_ids") },
+      )
+      get artifact.url
+      expect(response.status).to eq(404)
+
+      sign_in(user)
+      get artifact.url
+      expect(response.status).to eq(200)
+      expect(parse_srcdoc(response.body)).to include(artifact.html)
+    end
+
     it "revokes access to moved artifacts and later edits when a conversation is unshared" do
       artifact_post = Fabricate(:post, topic: topic, user: user)
       artifact.update!(post: artifact_post)
